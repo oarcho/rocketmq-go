@@ -1,0 +1,24 @@
+# 本地协作、编辑器与操作系统文件不进入 SDK 发布源码。
+AGENTS.md
+.agents/
+.trellis/
+.codex/
+.idea/
+.vscode/
+.DS_Store
+
+# 工作区、凭据、运行数据与构建结果由使用者本地管理。
+go.work
+go.work.sum
+.env
+.env.*
+*.local.yaml
+*.local.yml
+*.log
+*.test
+*.out
+*.prof
+coverage/
+bin/
+build/
+dist/
