@@ -23,9 +23,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oarcho/rocketmq-go/v5/pkg/ticker"
 	"github.com/oarcho/rocketmq-go/v5/pkg/utils"
 	v2 "github.com/oarcho/rocketmq-go/v5/protocol/v2"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -85,6 +85,7 @@ type defaultClientManager struct {
 	rpcClientTableLock sync.RWMutex
 	clientTable        sync.Map
 	done               chan struct{}
+	workers            sync.WaitGroup
 	opts               clientManagerOptions
 }
 
@@ -106,48 +107,81 @@ func (cm *defaultClientManager) UnRegisterClient(client Client) {
 	cm.clientTable.Delete(client.GetClientID())
 }
 
+// startUp 仍只启动四个原定时任务；同一 manager 负责它们的停止信号与真实退出。
 func (cm *defaultClientManager) startUp() {
 	sugarBaseLogger.Info("begin to start the client manager")
 
-	go func() {
-		time.Sleep(cm.opts.RPC_CLIENT_IDLE_CHECK_INITIAL_DELAY)
-		cm.clearIdleRpcClients()
-		ticker.Tick(cm.clearIdleRpcClients, (cm.opts.RPC_CLIENT_IDLE_CHECK_PERIOD), cm.done)
-	}()
-
-	go func() {
-		time.Sleep(cm.opts.HEART_BEAT_INITIAL_DELAY)
-		cm.doHeartbeat()
-		ticker.Tick(cm.doHeartbeat, (cm.opts.HEART_BEAT_PERIOD), cm.done)
-	}()
-
-	go func() {
-		time.Sleep(cm.opts.LOG_STATS_INITIAL_DELAY)
-		cm.doStats()
-		ticker.Tick(cm.doStats, (cm.opts.LOG_STATS_PERIOD), cm.done)
-	}()
-
-	go func() {
-		time.Sleep(cm.opts.SYNC_SETTINGS_DELAY)
-		cm.syncSettings()
-		ticker.Tick(cm.syncSettings, (cm.opts.SYNC_SETTINGS_PERIOD), cm.done)
-	}()
+	cm.workers.Add(4)
+	go cm.runScheduled(cm.opts.RPC_CLIENT_IDLE_CHECK_INITIAL_DELAY, cm.opts.RPC_CLIENT_IDLE_CHECK_PERIOD, cm.clearIdleRpcClients)
+	go cm.runScheduled(cm.opts.HEART_BEAT_INITIAL_DELAY, cm.opts.HEART_BEAT_PERIOD, cm.doHeartbeat)
+	go cm.runScheduled(cm.opts.LOG_STATS_INITIAL_DELAY, cm.opts.LOG_STATS_PERIOD, cm.doStats)
+	go cm.runScheduled(cm.opts.SYNC_SETTINGS_DELAY, cm.opts.SYNC_SETTINGS_PERIOD, cm.syncSettings)
 
 	sugarBaseLogger.Info("the client manager starts successfully")
 }
+
+// runScheduled 保留原首次延时与后续 tick 节奏，同时让停机可中断初始等待。
+// 不再由首次任务派生第二个后台循环；返回即释放 timer／ticker，并交回本 worker 的归属。
+func (cm *defaultClientManager) runScheduled(initialDelay, period time.Duration, action func()) {
+	defer cm.workers.Done()
+	initial := time.NewTimer(initialDelay)
+	defer initial.Stop()
+	select {
+	case <-cm.done:
+		return
+	case <-initial.C:
+	}
+	// 关闭与初始 timer 可能同时就绪，实际副作用紧前再确认原拥有者仍在运行。
+	select {
+	case <-cm.done:
+		return
+	default:
+	}
+	action()
+	periodic := time.NewTicker(period)
+	defer periodic.Stop()
+	for {
+		select {
+		case <-cm.done:
+			return
+		case <-periodic.C:
+			select {
+			case <-cm.done:
+				return
+			default:
+			}
+			action()
+		}
+	}
+}
+
+// deleteRpcClient 只摘除仍属同一实例的连接；旧调用的迟到错误不能删除新连接。
+// 连接真正关闭在索引锁外，避免网络收尾阻塞同池的其它状态访问。
 func (cm *defaultClientManager) deleteRpcClient(rpcClient RpcClient) {
-	delete(cm.rpcClientTable, rpcClient.GetTarget())
+	target := rpcClient.GetTarget()
+	cm.rpcClientTableLock.Lock()
+	if cm.rpcClientTable[target] != rpcClient {
+		cm.rpcClientTableLock.Unlock()
+		return
+	}
+	delete(cm.rpcClientTable, target)
+	cm.rpcClientTableLock.Unlock()
 	rpcClient.GracefulStop()
 }
 
+// clearIdleRpcClients 只快照池中实例，空闲判断和连接关闭不占用全局索引锁。
 func (cm *defaultClientManager) clearIdleRpcClients() {
-	cm.rpcClientTableLock.Lock()
-	defer cm.rpcClientTableLock.Unlock()
-	for target, rpcClient := range cm.rpcClientTable {
+	cm.rpcClientTableLock.RLock()
+	clients := make([]RpcClient, 0, len(cm.rpcClientTable))
+	for _, rpcClient := range cm.rpcClientTable {
+		clients = append(clients, rpcClient)
+	}
+	cm.rpcClientTableLock.RUnlock()
+	for _, rpcClient := range clients {
 		idleDuration := rpcClient.idleDuration()
 		if idleDuration > cm.opts.RPC_CLIENT_MAX_IDLE_DURATION {
 			cm.deleteRpcClient(rpcClient)
-			sugarBaseLogger.Warnf("rpc client has been idle for a long time, target=%s, idleDuration=%d, rpcClientMaxIdleDuration=%d\n", target, idleDuration, cm.opts.RPC_CLIENT_MAX_IDLE_DURATION)
+			sugarBaseLogger.Warnf("rpc client has been idle for a long time, target=%s, idleDuration=%d, rpcClientMaxIdleDuration=%d\n", rpcClient.GetTarget(), idleDuration, cm.opts.RPC_CLIENT_MAX_IDLE_DURATION)
 		}
 	}
 }
@@ -170,21 +204,34 @@ func (cm *defaultClientManager) syncSettings() {
 		return true
 	})
 }
+
+// shutdown 只由本客户端拥有者调用一次；关闭广播不等待任何 worker 恰好接收信号。
+// 先关闭已有连接解除实际 RPC，再等待四个原任务退出，不留下重建连接的后台拥有者。
 func (cm *defaultClientManager) shutdown() {
 	sugarBaseLogger.Info("begin to shutdown the client manager")
-	cm.done <- struct{}{}
 	close(cm.done)
 	cm.cleanRpcClient()
+	cm.workers.Wait()
 	sugarBaseLogger.Info("shutdown the client manager successfully")
 }
+
+// cleanRpcClient 先在索引锁内摘除现有连接，锁外关闭，避免全局索引锁跨平台／网络收尾。
 func (cm *defaultClientManager) cleanRpcClient() {
 	sugarBaseLogger.Info("clientManager start cleanRpcClient")
 	cm.rpcClientTableLock.Lock()
-	defer cm.rpcClientTableLock.Unlock()
-	for _, rpcClient := range cm.rpcClientTable {
-		cm.deleteRpcClient(rpcClient)
+	clients := make([]RpcClient, 0, len(cm.rpcClientTable))
+	for target, rpcClient := range cm.rpcClientTable {
+		delete(cm.rpcClientTable, target)
+		clients = append(clients, rpcClient)
+	}
+	cm.rpcClientTableLock.Unlock()
+	for _, rpcClient := range clients {
+		rpcClient.GracefulStop()
 	}
 }
+
+// getRpcClient 在锁外创建真实连接，再以原拥有者和同目标实例双检接纳。
+// 竞争落选或关闭后才返回的连接由本创建者关闭，不能漏进已清理的池或持锁 Dial。
 func (cm *defaultClientManager) getRpcClient(endpoints *v2.Endpoints) (RpcClient, error) {
 	var target string
 	if endpoints.GetScheme() == v2.AddressScheme_IPv4 || endpoints.GetScheme() == v2.AddressScheme_IPv6 {
@@ -194,45 +241,57 @@ func (cm *defaultClientManager) getRpcClient(endpoints *v2.Endpoints) (RpcClient
 		target = utils.ParseAddress(utils.SelectAnAddress(endpoints))
 	}
 	cm.rpcClientTableLock.RLock()
+	select {
+	case <-cm.done:
+		cm.rpcClientTableLock.RUnlock()
+		return nil, fmt.Errorf("client manager has been shut down")
+	default:
+	}
 	item, ok := cm.rpcClientTable[target]
 	cm.rpcClientTableLock.RUnlock()
 	if ok {
-		if ret, ok := item.(*rpcClient); ok {
-			return ret, nil
-		}
+		return item, nil
 	}
 
-	cm.rpcClientTableLock.Lock()
-	defer cm.rpcClientTableLock.Unlock()
-
-	// double check
-	item, ok = cm.rpcClientTable[target]
-	if ok {
-		if ret, ok := item.(*rpcClient); ok {
-			return ret, nil
-		}
-	}
-	rpcClient, err := NewRpcClient(target)
+	candidate, err := NewRpcClient(target)
 	if err != nil {
 		return nil, err
 	}
-	cm.rpcClientTable[target] = rpcClient
-	return rpcClient, nil
+	cm.rpcClientTableLock.Lock()
+	// Dial 期间可能已经关闭；不得在 shutdown 的快照之后重新把连接放入池。
+	select {
+	case <-cm.done:
+		cm.rpcClientTableLock.Unlock()
+		candidate.GracefulStop()
+		return nil, fmt.Errorf("client manager has been shut down")
+	default:
+	}
+	item, ok = cm.rpcClientTable[target]
+	if !ok {
+		cm.rpcClientTable[target] = candidate
+	}
+	cm.rpcClientTableLock.Unlock()
+	if ok {
+		candidate.GracefulStop()
+		return item, nil
+	}
+	return candidate, nil
 }
 func (cm *defaultClientManager) handleGrpcError(rpcClient RpcClient, err error) {
 	if err != nil {
 		if e, ok := status.FromError(err); ok {
 			if e.Code() == codes.Unavailable {
 				sugarBaseLogger.Errorf("happened unavailable err=%w, close rpcClient=%s", err, rpcClient.GetTarget())
-				cm.rpcClientTableLock.Lock()
-				defer cm.rpcClientTableLock.Unlock()
 				cm.deleteRpcClient(rpcClient)
 			}
 		}
 	}
 }
+
+// QueryRoute 在调用方上下文内查询路由；返回即释放本次 RPC 的期限与父链引用。
 func (cm *defaultClientManager) QueryRoute(ctx context.Context, endpoints *v2.Endpoints, request *v2.QueryRouteRequest, duration time.Duration) (*v2.QueryRouteResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -242,8 +301,10 @@ func (cm *defaultClientManager) QueryRoute(ctx context.Context, endpoints *v2.En
 	return ret, err
 }
 
+// QueryAssignments 查询消费分配；建连失败和正常响应都由本调用释放期限资源。
 func (cm *defaultClientManager) QueryAssignments(ctx context.Context, endpoints *v2.Endpoints, request *v2.QueryAssignmentRequest, duration time.Duration) (*v2.QueryAssignmentResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -253,8 +314,10 @@ func (cm *defaultClientManager) QueryAssignments(ctx context.Context, endpoints 
 	return ret, err
 }
 
+// SendMessage 等待原发送 RPC 的实际返回；收尾仅释放资源，不增加发送或重试。
 func (cm *defaultClientManager) SendMessage(ctx context.Context, endpoints *v2.Endpoints, request *v2.SendMessageRequest, duration time.Duration) (*v2.SendMessageResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -264,19 +327,27 @@ func (cm *defaultClientManager) SendMessage(ctx context.Context, endpoints *v2.E
 	return ret, err
 }
 
+// Telemetry 的期限属于真实双向流，不能在返回流句柄时就取消。
+// gRPC 完成回调覆盖正常结束、接收错误、父取消和连接关闭；创建失败则在本调用释放。
 func (cm *defaultClientManager) Telemetry(ctx context.Context, endpoints *v2.Endpoints, duration time.Duration) (v2.MessagingService_TelemetryClient, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	ret, err := rpcClient.Telemetry(ctx)
+	ret, err := rpcClient.Telemetry(ctx, grpc.OnFinish(func(error) { cancel() }))
+	if err != nil {
+		cancel()
+	}
 	cm.handleGrpcError(rpcClient, err)
 	return ret, err
 }
 
+// EndTransaction 保持调用方取消链；事务 RPC 结束时释放其独占期限。
 func (cm *defaultClientManager) EndTransaction(ctx context.Context, endpoints *v2.Endpoints, request *v2.EndTransactionRequest, duration time.Duration) (*v2.EndTransactionResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -286,8 +357,10 @@ func (cm *defaultClientManager) EndTransaction(ctx context.Context, endpoints *v
 	return ret, err
 }
 
+// HeartBeat 发送一次心跳；高频成功不应使已结束 RPC 的计时器存活到超时。
 func (cm *defaultClientManager) HeartBeat(ctx context.Context, endpoints *v2.Endpoints, request *v2.HeartbeatRequest, duration time.Duration) (*v2.HeartbeatResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -298,8 +371,10 @@ func (cm *defaultClientManager) HeartBeat(ctx context.Context, endpoints *v2.End
 	return ret, err
 }
 
+// NotifyClientTermination 在既定预算内通知终止，返回后不保留关闭阶段的期限资源。
 func (cm *defaultClientManager) NotifyClientTermination(ctx context.Context, endpoints *v2.Endpoints, request *v2.NotifyClientTerminationRequest, duration time.Duration) (*v2.NotifyClientTerminationResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -319,8 +394,10 @@ func (cm *defaultClientManager) ReceiveMessage(ctx context.Context, endpoints *v
 	return ret, err
 }
 
+// AckMessage 只确认原请求；RPC 返回后释放计时器，不把取消当作 ACK 成功。
 func (cm *defaultClientManager) AckMessage(ctx context.Context, endpoints *v2.Endpoints, request *v2.AckMessageRequest, duration time.Duration) (*v2.AckMessageResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -330,8 +407,10 @@ func (cm *defaultClientManager) AckMessage(ctx context.Context, endpoints *v2.En
 	return ret, err
 }
 
+// ChangeInvisibleDuration 修改本次不可见期；原结果与错误保留，期限在返回时回收。
 func (cm *defaultClientManager) ChangeInvisibleDuration(ctx context.Context, endpoints *v2.Endpoints, request *v2.ChangeInvisibleDurationRequest, duration time.Duration) (*v2.ChangeInvisibleDurationResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -341,8 +420,10 @@ func (cm *defaultClientManager) ChangeInvisibleDuration(ctx context.Context, end
 	return ret, err
 }
 
+// ForwardMessageToDeadLetterQueue 沿原请求执行移交，成功与失败均释放本次 RPC 的期限。
 func (cm *defaultClientManager) ForwardMessageToDeadLetterQueue(ctx context.Context, endpoints *v2.Endpoints, request *v2.ForwardMessageToDeadLetterQueueRequest, duration time.Duration) (*v2.ForwardMessageToDeadLetterQueueResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -351,9 +432,12 @@ func (cm *defaultClientManager) ForwardMessageToDeadLetterQueue(ctx context.Cont
 	cm.handleGrpcError(rpcClient, err)
 	return ret, err
 }
+
+// SyncLiteSubscription 同步轻量订阅；不让已完成同步继续占用父 Context 与计时器。
 func (cm *defaultClientManager) SyncLiteSubscription(ctx context.Context, endpoints *v2.Endpoints, request *v2.SyncLiteSubscriptionRequest,
 	duration time.Duration) (*v2.SyncLiteSubscriptionResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err
@@ -363,8 +447,10 @@ func (cm *defaultClientManager) SyncLiteSubscription(ctx context.Context, endpoi
 	return ret, err
 }
 
+// RecallMessage 保留撤回 RPC 的实际结局，调用返回只回收该期限，不重放撤回。
 func (cm *defaultClientManager) RecallMessage(ctx context.Context, endpoints *v2.Endpoints, request *v2.RecallMessageRequest, duration time.Duration) (*v2.RecallMessageResponse, error) {
-	ctx, _ = context.WithTimeout(ctx, duration)
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	rpcClient, err := cm.getRpcClient(endpoints)
 	if err != nil {
 		return nil, err

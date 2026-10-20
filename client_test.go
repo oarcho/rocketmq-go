@@ -24,9 +24,9 @@ import (
 	"testing"
 	"time"
 
+	gomock "github.com/golang/mock/gomock"
 	"github.com/oarcho/rocketmq-go/v5/credentials"
 	v2 "github.com/oarcho/rocketmq-go/v5/protocol/v2"
-	gomock "github.com/golang/mock/gomock"
 	"github.com/prashantv/gostub"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
@@ -226,14 +226,20 @@ func TestRestoreDefaultClientSessionZeroErrors(t *testing.T) {
 		t.Error(err)
 	}
 	observedLogs := PrepareTestLogger(cli)
-	default_cli_session.observer = &MOCK_MessagingService_TelemetryClient{
-		recv_error_count: 0,
-		cli:              cli,
+	// 仅迁移原上游夹具的资源类型；取消权仍由本夹具结束，不作为真实流证据。
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	default_cli_session.observer = &clientSessionObserver{
+		stream: &MOCK_MessagingService_TelemetryClient{
+			recv_error_count: 0,
+			cli:              cli,
+		},
+		cancel: cancel,
 	}
 	default_cli_session.recoveryWaitTime = time.Second
 	cli.settings = &simpleConsumerSettings{}
 
-	default_cli_session.publish(context.TODO(), &v2.TelemetryCommand{})
+	default_cli_session.publish(ctx, &v2.TelemetryCommand{})
 
 	// when
 	time.Sleep(3 * time.Second)
@@ -253,14 +259,20 @@ func TestRestoreDefaultClientSessionOneError(t *testing.T) {
 		t.Error(err)
 	}
 	observedLogs := PrepareTestLogger(cli)
-	default_cli_session.observer = &MOCK_MessagingService_TelemetryClient{
-		recv_error_count: 1,
-		cli:              cli,
+	// 原有 mock 不变，仅补齐新资源对象在夹具内的取消责任；此测试本轮不运行。
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	default_cli_session.observer = &clientSessionObserver{
+		stream: &MOCK_MessagingService_TelemetryClient{
+			recv_error_count: 1,
+			cli:              cli,
+		},
+		cancel: cancel,
 	}
 	default_cli_session.recoveryWaitTime = time.Second
 	cli.settings = &simpleConsumerSettings{}
 
-	default_cli_session.publish(context.TODO(), &v2.TelemetryCommand{})
+	default_cli_session.publish(ctx, &v2.TelemetryCommand{})
 	// when
 	time.Sleep(4 * time.Second)
 
@@ -280,14 +292,20 @@ func TestRestoreDefaultClientSessionTwoErrors(t *testing.T) {
 		t.Error(err)
 	}
 	observedLogs := PrepareTestLogger(cli)
-	default_cli_session.observer = &MOCK_MessagingService_TelemetryClient{
-		recv_error_count: 2,
-		cli:              cli,
+	// 维持上游失败样本，只迁移其拥有的流与取消权，不新增替代实现或断言。
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	default_cli_session.observer = &clientSessionObserver{
+		stream: &MOCK_MessagingService_TelemetryClient{
+			recv_error_count: 2,
+			cli:              cli,
+		},
+		cancel: cancel,
 	}
 	default_cli_session.recoveryWaitTime = time.Second
 	cli.settings = &simpleConsumerSettings{}
 
-	default_cli_session.publish(context.TODO(), &v2.TelemetryCommand{})
+	default_cli_session.publish(ctx, &v2.TelemetryCommand{})
 	// when
 	time.Sleep(4 * time.Second)
 

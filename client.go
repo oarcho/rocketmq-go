@@ -27,11 +27,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	innerMD "github.com/oarcho/rocketmq-go/v5/metadata"
 	"github.com/oarcho/rocketmq-go/v5/pkg/ticker"
 	"github.com/oarcho/rocketmq-go/v5/pkg/utils"
 	v2 "github.com/oarcho/rocketmq-go/v5/protocol/v2"
-	"github.com/google/uuid"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/metadata"
@@ -52,9 +52,18 @@ type isClient interface {
 	onVerifyMessageCommand(endpoints *v2.Endpoints, command *v2.VerifyMessageCommand) error
 	IsEndpointUpdated() bool
 }
+
+// clientSessionObserver 只拥有一条真实流及其取消／发送资源，不增加业务状态或转发层。
+// 不同代流各自串行发送，旧流收尾不能阻塞新流接收，也不能取消新流。
+type clientSessionObserver struct {
+	stream   v2.MessagingService_TelemetryClient
+	cancel   context.CancelFunc
+	sendLock sync.Mutex
+}
+
 type defaultClientSession struct {
 	endpoints        *v2.Endpoints
-	observer         v2.MessagingService_TelemetryClient
+	observer         *clientSessionObserver
 	observerLock     sync.RWMutex
 	cli              *defaultClient
 	timeout          time.Duration
@@ -77,12 +86,14 @@ func NewDefaultClientSession(target string, cli *defaultClient) (*defaultClientS
 	return cs, nil
 }
 
-func (cs *defaultClientSession) _acquire_observer() (v2.MessagingService_TelemetryClient, bool) {
+// _acquire_observer 只返回已完成创建的原流；创建中的资源仍可被停机取消。
+func (cs *defaultClientSession) _acquire_observer() (*clientSessionObserver, bool) {
 	cs.observerLock.RLock()
 	observer := cs.observer
+	ready := observer != nil && observer.stream != nil
 	cs.observerLock.RUnlock()
 
-	if observer == nil {
+	if !ready {
 		time.Sleep(time.Second)
 		return nil, false
 	} else {
@@ -115,8 +126,12 @@ func (cs *defaultClientSession) startUp() {
 				continue
 			}
 
-			response, err := observer.Recv()
+			response, err := observer.stream.Recv()
 			if err != nil {
+				// 正常停机通过原流取消解除 Recv；不把这次预期退出误报为启动或恢复失败。
+				if !cs.cli.isRunning() {
+					return
+				}
 				// If the client has not yet initialized, propagate the error to startUp() so it can
 				// return immediately instead of blocking forever waiting for settings.
 				if !cs.cli.inited.Load() {
@@ -133,7 +148,7 @@ func (cs *defaultClientSession) startUp() {
 				} else {
 					// we are recovering but we failed to read the message again, resetting observer
 					cs.cli.log.Infof("Failed to recover, err=%v", err)
-					cs.release()
+					cs.release(observer)
 					cs.recovering = false
 				}
 				continue
@@ -147,7 +162,7 @@ func (cs *defaultClientSession) startUp() {
 					cs.cli.log.Info("Managed to recover")
 				} else {
 					cs.cli.log.Errorf("Failed to recover, Some of the servers are unhealthy, Heartbeat err=%w", err)
-					cs.release()
+					cs.release(observer)
 				}
 				cs.recovering = false
 			}
@@ -178,41 +193,80 @@ func (cs *defaultClientSession) handleTelemetryCommand(response *v2.TelemetryCom
 	}
 	return nil
 }
-func (cs *defaultClientSession) release() {
+
+// release 只移交观察到的原流；旧 Recv 的迟到错误不能清空或取消后来建立的新流。
+// 先在状态锁内摘除资源，再在锁外取消，以解除可能正在阻塞的 Send／Recv。
+func (cs *defaultClientSession) release(expected *clientSessionObserver) {
 	cs.observerLock.Lock()
-	defer cs.observerLock.Unlock()
-	if err := cs.observer.CloseSend(); err != nil {
-		cs.cli.log.Errorf("release defaultClientSession err=%v", err)
+	if expected == nil || cs.observer != expected {
+		cs.observerLock.Unlock()
+		return
 	}
 	cs.observer = nil
-}
-func (cs *defaultClientSession) publish(ctx context.Context, common *v2.TelemetryCommand) error {
-	var err error
+	cs.observerLock.Unlock()
 
-	f0 := func() (bool, error) {
-		cs.observerLock.RLock()
-		defer cs.observerLock.RUnlock()
-		if cs.observer != nil {
-			return true, cs.observer.Send(common)
+	expected.cancel()
+	// gRPC 不允许 Send 与 CloseSend 并行。这里只等原发送退出，绝不持有状态锁等网络。
+	// 即便仍在创建流，也要经过这个原入口的尾屏障，确保创建者已处理自己的取消。
+	expected.sendLock.Lock()
+	defer expected.sendLock.Unlock()
+	if expected.stream != nil {
+		if err := expected.stream.CloseSend(); err != nil {
+			cs.cli.log.Errorf("release defaultClientSession err=%v", err)
 		}
-		return false, nil
 	}
-	over, err := f0()
-	if over {
+}
+
+// publish 串行创建与发送原 Telemetry 流；状态锁只管理句柄／取消权，不跨网络调用。
+// 流创建期间先登记取消权，使停机可以取消建流；成功句柄仍由同一会话独占。
+func (cs *defaultClientSession) publish(ctx context.Context, common *v2.TelemetryCommand) error {
+	cs.observerLock.Lock()
+	if !cs.cli.isRunning() {
+		cs.observerLock.Unlock()
+		return fmt.Errorf("client has been closed")
+	}
+	observer := cs.observer
+	if observer != nil {
+		cs.observerLock.Unlock()
+		observer.sendLock.Lock()
+		defer observer.sendLock.Unlock()
+		cs.observerLock.RLock()
+		current := cs.observer == observer
+		cs.observerLock.RUnlock()
+		if !current {
+			return context.Canceled
+		}
+		return observer.stream.Send(common)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	observer = &clientSessionObserver{cancel: cancel}
+	// 新锁尚未发布，不存在竞争等待；创建者先占有它，后续发送只能等建流完成。
+	observer.sendLock.Lock()
+	defer observer.sendLock.Unlock()
+	cs.observer = observer
+	cs.observerLock.Unlock()
+
+	stream, err := cs.cli.clientManager.Telemetry(ctx, cs.endpoints, cs.timeout)
+	if err != nil {
+		cs.observerLock.Lock()
+		if cs.observer == observer {
+			cs.observer = nil
+		}
+		cs.observerLock.Unlock()
+		cancel()
 		return err
 	}
-
 	cs.observerLock.Lock()
-	defer cs.observerLock.Unlock()
-	if cs.observer == nil {
-		tc, err := cs.cli.clientManager.Telemetry(ctx, cs.endpoints, cs.timeout)
-		if err != nil {
-			return err
-		}
-		cs.observer = tc
+	// 停机可能已经取消并摘除了创建中的资源；不能将迟到的成功句柄重新发布。
+	if !cs.cli.isRunning() || cs.observer != observer {
+		cs.observerLock.Unlock()
+		cancel()
+		stream.CloseSend()
+		return fmt.Errorf("client has been closed")
 	}
-	err = cs.observer.Send(common)
-	return err
+	observer.stream = stream
+	cs.observerLock.Unlock()
+	return stream.Send(common)
 }
 
 type NewClientFunc func(*Config, ...ClientOption) (Client, error)
@@ -229,6 +283,7 @@ type defaultClient struct {
 	router                        sync.Map
 	clientID                      string
 	clientManager                 ClientManager
+	ownedClientManager            *defaultClientManager
 	done                          chan struct{}
 	clientMeterProvider           ClientMeterProvider
 	messageInterceptors           []MessageInterceptor
@@ -295,6 +350,7 @@ func (cli *defaultClient) GetClientID() string {
 	return cli.clientID
 }
 
+// getDefaultClientSession 在原索引内创建端点会话；停机后不再产生漏过收尾快照的新会话。
 func (cli *defaultClient) getDefaultClientSession(target string) (*defaultClientSession, error) {
 	cli.endpointsTelemetryClientsLock.RLock()
 	tc, ok := cli.endpointsTelemetryClientTable[target]
@@ -304,6 +360,9 @@ func (cli *defaultClient) getDefaultClientSession(target string) (*defaultClient
 	}
 	cli.endpointsTelemetryClientsLock.Lock()
 	defer cli.endpointsTelemetryClientsLock.Unlock()
+	if !cli.isRunning() {
+		return nil, fmt.Errorf("client has been closed")
+	}
 	if tc, ok := cli.endpointsTelemetryClientTable[target]; ok {
 		return tc, nil
 	}
@@ -537,9 +596,11 @@ func (cli *defaultClient) telemeter(target string, command *v2.TelemetryCommand)
 	return nil
 }
 
+// startUp 为本客户端创建唯一 manager；取消与连接回收权登记给原 GracefulStop。
 func (cli *defaultClient) startUp() error {
 	cli.log.Infof("begin to start the rocketmq client")
 	cm := NewDefaultClientManager()
+	cli.ownedClientManager = cm
 	cm.startUp()
 	cm.RegisterClient(cli)
 	cli.clientManager = cm
@@ -641,6 +702,8 @@ func (cli *defaultClient) notifyClientTermination() {
 	}
 }
 
+// GracefulStop 关闭原客户端，并显式结束其拥有的 Telemetry 流，而不只关闭循环信号。
+// 每个流先取消再经过发送尾屏障；真实流终结负责释放 gRPC 期限，旧取消不会影响新流。
 func (cli *defaultClient) GracefulStop() error {
 	if !cli.on.CAS(true, false) {
 		return fmt.Errorf("client has been closed")
@@ -651,6 +714,24 @@ func (cli *defaultClient) GracefulStop() error {
 	}
 	cli.done <- struct{}{}
 	close(cli.done)
+
+	// 索引锁只取现有会话快照；实际取消、CloseSend 和发送结束都在索引锁外完成。
+	cli.endpointsTelemetryClientsLock.RLock()
+	sessions := make([]*defaultClientSession, 0, len(cli.endpointsTelemetryClientTable))
+	for _, session := range cli.endpointsTelemetryClientTable {
+		sessions = append(sessions, session)
+	}
+	cli.endpointsTelemetryClientsLock.RUnlock()
+	for _, session := range sessions {
+		session.observerLock.RLock()
+		observer := session.observer
+		session.observerLock.RUnlock()
+		session.release(observer)
+	}
+	// 尚未 Start 的客户端没有创建 manager；已创建者必须等其原任务和连接真实结束。
+	if cli.ownedClientManager != nil {
+		cli.ownedClientManager.shutdown()
+	}
 	cli.clientMeterProvider.Reset(&v2.Metric{
 		On: false,
 	})

@@ -9,8 +9,9 @@ import (
 	reflect "reflect"
 	time "time"
 
-	v2 "github.com/oarcho/rocketmq-go/v5/protocol/v2"
 	gomock "github.com/golang/mock/gomock"
+	v2 "github.com/oarcho/rocketmq-go/v5/protocol/v2"
+	grpc "google.golang.org/grpc"
 )
 
 // MockRpcClient is a mock of RpcClient interface.
@@ -184,6 +185,21 @@ func (mr *MockRpcClientMockRecorder) QueryRoute(ctx, request interface{}) *gomoc
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryRoute", reflect.TypeOf((*MockRpcClient)(nil).QueryRoute), ctx, request)
 }
 
+// RecallMessage mocks base method.
+func (m *MockRpcClient) RecallMessage(ctx context.Context, request *v2.RecallMessageRequest) (*v2.RecallMessageResponse, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RecallMessage", ctx, request)
+	ret0, _ := ret[0].(*v2.RecallMessageResponse)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RecallMessage indicates an expected call of RecallMessage.
+func (mr *MockRpcClientMockRecorder) RecallMessage(ctx, request interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RecallMessage", reflect.TypeOf((*MockRpcClient)(nil).RecallMessage), ctx, request)
+}
+
 // ReceiveMessage mocks base method.
 func (m *MockRpcClient) ReceiveMessage(ctx context.Context, request *v2.ReceiveMessageRequest) (v2.MessagingService_ReceiveMessageClient, error) {
 	m.ctrl.T.Helper()
@@ -229,34 +245,24 @@ func (mr *MockRpcClientMockRecorder) SyncLiteSubscription(ctx, request interface
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncLiteSubscription", reflect.TypeOf((*MockRpcClient)(nil).SyncLiteSubscription), ctx, request)
 }
 
-// RecallMessage mocks base method.
-func (m *MockRpcClient) RecallMessage(ctx context.Context, request *v2.RecallMessageRequest) (*v2.RecallMessageResponse, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "RecallMessage", ctx, request)
-	ret0, _ := ret[0].(*v2.RecallMessageResponse)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// RecallMessage indicates an expected call of RecallMessage.
-func (mr *MockRpcClientMockRecorder) RecallMessage(ctx, request interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RecallMessage", reflect.TypeOf((*MockRpcClient)(nil).RecallMessage), ctx, request)
-}
-
 // Telemetry mocks base method.
-func (m *MockRpcClient) Telemetry(ctx context.Context) (v2.MessagingService_TelemetryClient, error) {
+func (m *MockRpcClient) Telemetry(ctx context.Context, opts ...grpc.CallOption) (v2.MessagingService_TelemetryClient, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Telemetry", ctx)
+	varargs := []interface{}{ctx}
+	for _, a := range opts {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "Telemetry", varargs...)
 	ret0, _ := ret[0].(v2.MessagingService_TelemetryClient)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // Telemetry indicates an expected call of Telemetry.
-func (mr *MockRpcClientMockRecorder) Telemetry(ctx interface{}) *gomock.Call {
+func (mr *MockRpcClientMockRecorder) Telemetry(ctx interface{}, opts ...interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Telemetry", reflect.TypeOf((*MockRpcClient)(nil).Telemetry), ctx)
+	varargs := append([]interface{}{ctx}, opts...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Telemetry", reflect.TypeOf((*MockRpcClient)(nil).Telemetry), varargs...)
 }
 
 // idleDuration mocks base method.

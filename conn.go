@@ -24,8 +24,8 @@ import (
 
 	"github.com/oarcho/rocketmq-go/v5/pkg/utils"
 
-	"github.com/oarcho/rocketmq-go/v5/pkg/grpc/middleware/zaplog"
 	validator "github.com/go-playground/validator/v10"
+	"github.com/oarcho/rocketmq-go/v5/pkg/grpc/middleware/zaplog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -58,6 +58,7 @@ type clientConn struct {
 	validate *validator.Validate
 }
 
+// NewClientConn 校验真实连接预算后才创建可取消资源；成功连接的取消权交给 Close。
 var NewClientConn = func(endpoint string, opts ...ConnOption) (ClientConn, error) {
 	client := &clientConn{
 		opts:     defaultConnOptions,
@@ -70,15 +71,6 @@ var NewClientConn = func(endpoint string, opts ...ConnOption) (ClientConn, error
 		opt.apply(&client.opts)
 	}
 
-	baseCtx := context.TODO()
-	if client.opts.Context != nil {
-		baseCtx = client.opts.Context
-	}
-
-	ctx, cancel := context.WithCancel(baseCtx)
-
-	client.ctx = ctx
-	client.cancel = cancel
 	client.creds = credentials.NewTLS(client.opts.TLS)
 
 	if client.opts.MaxCallSendMsgSize > 0 || client.opts.MaxCallRecvMsgSize > 0 {
@@ -92,6 +84,13 @@ var NewClientConn = func(endpoint string, opts ...ConnOption) (ClientConn, error
 			client.callOpts = append(client.callOpts, grpc.MaxCallRecvMsgSize(client.opts.MaxCallRecvMsgSize))
 		}
 	}
+
+	// 预算拒绝尚未分配 Context；开始实际建连后，失败由此处取消，成功由连接释放。
+	baseCtx := context.TODO()
+	if client.opts.Context != nil {
+		baseCtx = client.opts.Context
+	}
+	client.ctx, client.cancel = context.WithCancel(baseCtx)
 
 	conn, err := client.dial(endpoint)
 	if err != nil {
@@ -126,6 +125,7 @@ func (c *clientConn) dialSetupOpts(dopts ...grpc.DialOption) (opts []grpc.DialOp
 	return
 }
 
+// dial 只拥有本次阻塞建连的期限，连接成功后仍由 clientConn.Close 结束其真正生命周期。
 func (c *clientConn) dial(target string, dopts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	opts, err := c.dialSetupOpts(dopts...)
 	if err != nil {
@@ -139,7 +139,10 @@ func (c *clientConn) dial(target string, dopts ...grpc.DialOption) (*grpc.Client
 
 	dctx := c.ctx
 	if c.opts.DialTimeout > 0 {
-		dctx, _ = context.WithTimeout(c.ctx, c.opts.DialTimeout)
+		// DialContext 返回后不再需要建连计时器；取消它不会关闭已经建立的连接。
+		var cancel context.CancelFunc
+		dctx, cancel = context.WithTimeout(c.ctx, c.opts.DialTimeout)
+		defer cancel()
 	}
 	conn, err := grpc.DialContext(dctx, target, opts...)
 	if err != nil {
